@@ -21,12 +21,16 @@
     ./services/freeradius.nix
 
     ./services/stepca.nix
+    ./services/generate-certs.nix
     ./services/cert-sync.nix
 
     ./tools/wg-peer-sync.nix
     ./tools/torrent-routing.nix
 
     ./services/containers.nix
+    ./services/containers-tor.nix
+    ./services/containers-i2p.nix
+    ./services/containers-yellow.nix
     ./services/authgate.nix
     ./services/filesharing.nix
     ./services/proxying.nix

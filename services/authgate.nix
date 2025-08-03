@@ -1,104 +1,88 @@
 { config, pkgs, lib, ... }:
 
 let
-  inherit (import ../networking/variables.nix) localDomain authgateServices authgatePublicServices vlans;
+  inherit (import ../networking/variables.nix)
+    localDomain
+    vlans
+    authgatePublicServices
+    authgatePrivateServices
+    authgateOAuth2Services;
 
-  containerIP = "192.168.${toString vlans.services.id}.6";
-  sambaCerts = "/mnt/samba/certs";
-  sharedBase = "/mnt/shared";
-  vaultwardenSecretPath = "/mnt/vaultwarden/secrets";
+  # Consolidate services
+  allServices = builtins.concatLists [ authgatePublicServices authgatePrivateServices authgateOAuth2Services ];
 
-  isPublic = name: builtins.elem name authgatePublicServices;
+  mkServerBlock = service: let
+    isOAuth = builtins.elem service authgateOAuth2Services;
+    isPublic = builtins.elem service authgatePublicServices;
+    isPrivate = builtins.elem service authgatePrivateServices;
 
-  mkOauth2Config = name: {
-    listen = "127.0.0.1:418${toString (builtins.hashString "sha256" name).charCodeAt(0) % 100}";
-    upstream = "http://${name}.${localDomain}";
-    provider = "keycloak";
-    extra_args = {
-      email_domains = [ "*" ];
-      pass_authorization_header = true;
-      set_authorization_header = true;
-      scope = "openid email profile groups";
-      cookie_secure = false;
-    };
-  };
-
-  mkNginxBlock = name: ''
+    allowIPs = lib.optionals (isPublic || isPrivate) (service.allowedIPs or []);
+    allowGroups = lib.optionals isOAuth (service.allowedGroups or []);
+    host = "${service.name}.${localDomain}";
+  in ''
     server {
-      listen ${if isPublic name then "80" else "127.0.0.1:80"};
-      server_name ${name}.${localDomain};
+      listen 443 ssl;
+      server_name ${host};
 
-      location / {
-        proxy_pass http://127.0.0.1:418${toString (builtins.hashString "sha256" name).charCodeAt(0) % 100};
-        proxy_set_header Host $host;
-        proxy_set_header X-Real-IP $remote_addr;
-        proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
-        proxy_set_header X-Forwarded-Proto $scheme;
-      }
-    }
-  '';
+      ssl_certificate /etc/caddy/certs/${host}.crt;
+      ssl_certificate_key /etc/caddy/certs/${host}.key;
 
-  mkCaddyBlock = name: ''
-    ${name}.${localDomain} {
-      reverse_proxy 127.0.0.1:80
-      encode gzip
-      tls {
-        on_demand
-      }
+      ${lib.optionalString (isOAuth) ''
+        location / {
+          include /etc/nginx/oauth2-proxy.conf;
+          proxy_pass http://${service.ip}:${toString service.port};
+        }
+      ''}
+
+      ${lib.optionalString (!isOAuth) ''
+        location / {
+          proxy_pass http://${service.ip}:${toString service.port};
+        }
+      ''}
+
+      ${lib.optionalString (allowIPs != []) ''
+        allow ${lib.concatStringsSep ";\n    allow " allowIPs};
+        deny all;
+      ''}
     }
   '';
 in
 {
-  environment.etc."authgate/oauth2-config.json".text = builtins.toJSON {
-    providers = {
-      keycloak = {
-        provider = "keycloak";
-        client_id = "authgate";
-        client_secret_path = "${vaultwardenSecretPath}/authgate-client-secret.txt";
-        oidc_issuer_url = "https://keycloak.${localDomain}/realms/nixos";
-      };
-    };
-
-    services = lib.listToAttrs (map (svc: {
-      name = svc;
-      value = mkOauth2Config svc;
-    }) authgateServices);
-  };
-
-  environment.etc."authgate/nginx.conf".text = ''
-    events {}
-    http {
-      ${lib.concatStringsSep "\n" (map mkNginxBlock authgateServices)}
-    }
-  '';
-
-  environment.etc."authgate/Caddyfile".text =
-    lib.concatStringsSep "\n\n" (
-      map mkCaddyBlock authgatePublicServices
-    );
-
-  # Certificates for nginx
-  environment.etc."ssl".source = "${sambaCerts}/authgate";
+  networking.firewall.allowedTCPPorts = [ 443 ];
+  networking.firewall.allowedUDPPorts = [ ];
 
   systemd.services.authgate = {
-    description = "Authgate Container";
+    description = "Authgate NGINX Proxy";
     wantedBy = [ "multi-user.target" ];
     after = [ "network.target" ];
     serviceConfig = {
+      Type = "simple";
       ExecStart = ''
-        ${pkgs.podman}/bin/podman run --rm --network=bridge \
-          --name authgate \
-          --ip=${containerIP} \
-          -v /etc/authgate:/config:ro \
-          -v /etc/ssl:/ssl:ro \
-          -v ${vaultwardenSecretPath}:/secrets:ro \
-          docker.io/your/authgate-image
+        ${pkgs.nginx}/bin/nginx -c /etc/nginx/nginx.conf -g 'daemon off;'
       '';
-      Restart = "on-failure";
+      Restart = "always";
     };
   };
 
-  # Metrics port and firewall rules (optional)
-  networking.firewall.allowedTCPPorts = lib.mkIf (authgatePublicServices != [ ]) [ 80 443 ];
+  environment.etc."nginx/nginx.conf".text = ''
+    worker_processes 1;
+    events {
+      worker_connections 1024;
+    }
+    http {
+      include       mime.types;
+      default_type  application/octet-stream;
+
+      sendfile        on;
+      keepalive_timeout  65;
+
+      ${lib.concatStringsSep "\n\n" (map mkServerBlock allServices)}
+    }
+  '';
+
+  # Certificates should be placed by Caddy
+  systemd.tmpfiles.rules = [
+    "d /etc/caddy/certs 0755 root root -"
+  ];
 }
 

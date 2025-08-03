@@ -1,14 +1,15 @@
 { config, pkgs, lib, ... }:
 
 let
-  inherit (import ../networking/variables.nix) localDomain vlans;
+  inherit (import ../networking/variables.nix) localDomain vlans containerSpecs authgatePublicServices;
   sharedBase = "/mnt/shared";
   sambaCerts = "/mnt/samba/certs";
 
-  containerDefaults = name: vlan: hostPorts: bind127: mounts: {
+  containerDefaults = name: vlanList: hostPorts: bind127: image: mounts: {
     autoStart = true;
     execConfig = {
-      hostname = "${name}.${vlan.name}.${localDomain}";
+      image = image;
+      hostname = "${name}.${localDomain}";
       restartPolicy = "always";
       extraOptions =
         [ "--network=none" ]
@@ -21,49 +22,73 @@ let
       };
     };
     dnsConfig = {
-      hostname = "${name}.${vlan.name}.${localDomain}";
+      hostname = "${name}.${localDomain}";
       powerdnsSync = true;
     };
   };
+
+  certPaths = [
+    "${sambaCerts}/services"
+    "${sambaCerts}/hidden-services"
+  ] ++ (map (vlan: "${sambaCerts}/${vlan.name}.${localDomain}") (lib.attrValues vlans))
+    ++ (map (name: "${sambaCerts}/public/${authgatePublicServices.${name}}") (builtins.attrNames authgatePublicServices));
+
+  containerMounts = name: shared: samba: certPaths: shared ++ [ "${samba}:/certs:ro" ] ++ certPaths;
+
+  containerNames = builtins.attrNames containerSpecs;
+
+  containerEntries = builtins.listToAttrs (map (name:
+    let
+      spec = containerSpecs.${name};
+      resolvedVLANs = map (v: vlans.${v}) spec.vlans;
+      mounts = containerMounts name ["${sharedBase}/${name}:/data:z"] "${sambaCerts}/${name}" certPaths;
+    in {
+      name = name;
+      value = containerDefaults name resolvedVLANs spec.port spec.bind127 spec.image mounts;
+    }) containerNames);
+
+  systemdUnits = builtins.concatLists (map (name: [
+    {
+      "name" = "restart-${name}.service";
+      "text" = ''
+        [Unit]
+        Description=Restart container ${name} on cert update
+        [Service]
+        Type=oneshot
+        ExecStart=${pkgs.podman}/bin/podman restart ${name}
+      '';
+    }
+    {
+      "name" = "watch-${name}.path";
+      "text" = ''
+        [Unit]
+        Description=Watch cert path for ${name}
+        [Path]
+        PathChanged=${sambaCerts}/${name}
+        PathChanged=${sambaCerts}/services
+        PathChanged=${sambaCerts}/hidden-services
+        '' + builtins.concatStringsSep "\n" (map (vlan: "PathChanged=${sambaCerts}/${vlan.name}.${localDomain}") (lib.attrValues vlans)) +
+        "\n" + builtins.concatStringsSep "\n" (map (s: "PathChanged=${sambaCerts}/public/${s}") (builtins.attrValues authgatePublicServices)) + ''
+        Unit=restart-${name}.service
+        [Install]
+        WantedBy=multi-user.target
+      '';
+    }
+  ]) containerNames);
+
 in
 {
   virtualisation.podman.enable = true;
 
-  virtualisation.oci-containers.containers = {
-    homeassistant = containerDefaults "homeassistant" vlans.iot "8123:8123" true [
-      "${sharedBase}/homeassistant:/config:z"
-      "${sambaCerts}/homeassistant:/certs:ro"
-    ];
+  virtualisation.oci-containers.containers = containerEntries;
 
-    shinobi = containerDefaults "shinobi" vlans.iot "8080:8080" true [
-      "${sharedBase}/shinobi:/config:z"
-      "${sambaCerts}/shinobi:/certs:ro"
-    ];
+  systemd.services = builtins.listToAttrs (map (u: {
+    name = u.name;
+    value = { text = u.text; }; }) (filter (u: u.name hasSuffix ".service") systemdUnits));
 
-    deluge = containerDefaults "deluge" vlans.media "8112:8112" true [
-      "${sharedBase}/torrents:/downloads:z"
-      "${sambaCerts}/deluge:/certs:ro"
-    ];
-
-    bitmagnet = containerDefaults "bitmagnet" vlans.media null true [
-      "${sharedBase}/torrents:/data:z"
-      "${sambaCerts}/bitmagnet:/certs:ro"
-    ];
-
-    keycloak = containerDefaults "keycloak" vlans.services "8081:8081" true [
-      "${sharedBase}/keycloak:/data:z"
-      "${sambaCerts}/keycloak:/certs:ro"
-    ];
-
-    authgate = containerDefaults "authgate" vlans.services null true [
-      "${sharedBase}/authgate:/config:z"
-      "${sambaCerts}/authgate:/certs:ro"
-    ];
-
-    vaultwarden = containerDefaults "vaultwarden" vlans.services "8222:80" true [
-      "${sharedBase}/vaultwarden:/data:z"
-    ];
-  };
+  systemd.paths = builtins.listToAttrs (map (u: {
+    name = u.name;
+    value = { text = u.text; }; }) (filter (u: u.name hasSuffix ".path") systemdUnits));
 
   # Systemd containers (e.g. DHCP, Samba AD) will be configured in their own service files
 }

@@ -1,0 +1,114 @@
+{ config, pkgs, lib, ... }:
+
+let
+  inherit (import ../networking/variables.nix) vlans localDomain subnetPrefix;
+
+  stepCaDir = "/var/lib/step-ca";
+  sambaCertsPath = "/srv/samba/certs";
+
+  secretsPath = "/mnt/vaultwarden/secrets";
+in
+{
+  # Install step-ca
+  environment.systemPackages = [ pkgs.step-ca ];
+
+  # Intermediate CA configuration and files
+  systemd.services.step-ca = {
+    description = "step-ca intermediate certificate authority";
+    after = [ "network.target" ];
+    wantedBy = [ "multi-user.target" ];
+
+    serviceConfig = {
+      ExecStart = "${pkgs.step-ca}/bin/step-ca ${stepCaDir}/config/ca.json --password-file ${secretsPath}/stepca-password.txt";
+      Restart = "on-failure";
+      User = "root";
+    };
+
+    preStart = ''
+      mkdir -p ${stepCaDir}/config
+      mkdir -p ${stepCaDir}/db
+      cp -n ${secretsPath}/stepca-root.crt ${stepCaDir}/certs/root_ca.crt
+      cp -n ${secretsPath}/stepca-intermediate.crt ${stepCaDir}/certs/intermediate_ca.crt
+      cp -n ${secretsPath}/stepca-intermediate.key ${stepCaDir}/secrets/intermediate_ca_key
+    '';
+  };
+
+  # Cert sync: copies certs from step-ca to Samba share
+  systemd.services.sync-stepca-certs = {
+    description = "Sync issued certificates to Samba certs share";
+    script = ''
+      set -euo pipefail
+
+      mkdir -p ${sambaCertsPath}
+
+      for hostname in $(ls ${stepCaDir}/certs/issued); do
+        srcdir="${stepCaDir}/certs/issued/$hostname"
+        dstdir="${sambaCertsPath}/$hostname"
+        mkdir -p "$dstdir"
+
+        if [ -f "$srcdir/fullchain.pem" ]; then
+          cp -f "$srcdir/fullchain.pem" "$dstdir/fullchain.pem"
+        fi
+        if [ -f "$srcdir/key.pem" ]; then
+          cp -f "$srcdir/key.pem" "$dstdir/privkey.pem"
+        elif [ -f "$srcdir/privkey.pem" ]; then
+          cp -f "$srcdir/privkey.pem" "$dstdir/privkey.pem"
+        fi
+      done
+    '';
+    serviceConfig = {
+      Type = "oneshot";
+      User = "root";
+    };
+    wantedBy = [ "multi-user.target" ];
+  };
+
+  # Renew + Sync certs daily
+  systemd.services.generate-vlan-wildcards = {
+    description = "Generate wildcard certs for each VLAN and special hosts";
+    after = [ "network.target" ];
+    wantedBy = [ "multi-user.target" ];
+    serviceConfig = {
+      Type = "oneshot";
+      ExecStart = pkgs.writeShellScript "generate-vlan-wildcards" ''
+        set -euxo pipefail
+
+        mkdir -p ${stepCaDir}/certs/issued
+
+        for vlanName in ${lib.concatStringsSep " " (lib.attrNames vlans)}; do
+          domain="*.${vlanName}.${localDomain}"
+          outdir="${stepCaDir}/certs/issued/${vlanName}.${localDomain}"
+          mkdir -p "$outdir"
+          step ca certificate "$domain" \
+            "$outdir/fullchain.pem" \
+            "$outdir/privkey.pem" \
+            --provisioner admin \
+            --password-file ${secretsPath}/stepca-password.txt || true
+        done
+
+        # Also issue for yellow and authgate explicitly
+        for hostname in yellow authgate; do
+          domain="${hostname}.${localDomain}"
+          outdir="${stepCaDir}/certs/issued/$hostname"
+          mkdir -p "$outdir"
+          step ca certificate "$domain" \
+            "$outdir/fullchain.pem" \
+            "$outdir/privkey.pem" \
+            --provisioner admin \
+            --password-file ${secretsPath}/stepca-password.txt || true
+        done
+      '';
+      User = "root";
+    };
+  };
+
+  systemd.timers.sync-stepca-certs = {
+    description = "Daily cert sync to Samba share";
+    wantedBy = [ "timers.target" ];
+    timerConfig = {
+      OnCalendar = "daily";
+      Persistent = true;
+    };
+  };
+}
+
